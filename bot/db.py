@@ -56,6 +56,7 @@ class Database:
     async def connect(self) -> None:
         self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
         await self.pool.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_answer_text TEXT")
+        await self.pool.execute("ALTER TABLE theory_pages ADD COLUMN IF NOT EXISTS topic_id INTEGER REFERENCES topics(id)")
 
     async def close(self) -> None:
         if self._pool:
@@ -104,17 +105,29 @@ class Database:
         )
         return [Topic(**dict(row)) for row in rows]
 
-    async def list_theory_pages(self) -> list[TheoryPage]:
+    async def list_theory_pages(self, topic_id: int | None = None) -> list[TheoryPage]:
+        if topic_id is None:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, page_order, title, text_content, image_file_id
+                FROM theory_pages
+                ORDER BY page_order, id
+                """
+            )
+            return [TheoryPage(**dict(row)) for row in rows]
+
         rows = await self.pool.fetch(
             """
             SELECT id, page_order, title, text_content, image_file_id
             FROM theory_pages
+            WHERE topic_id = $1
             ORDER BY page_order, id
-            """
+            """,
+            topic_id,
         )
         return [TheoryPage(**dict(row)) for row in rows]
 
-    async def get_next_task(self, student_id: int, teacher_id: int, mode: str) -> Task | None:
+    async def get_next_task(self, student_id: int, teacher_id: int, mode: str, topic_id: int) -> Task | None:
         row = await self.pool.fetchrow(
             """
             SELECT t.id, tp.title AS topic_title, t.mode, t.task_text, t.task_hint_text, t.task_answer_text, t.task_image_file_id
@@ -122,6 +135,7 @@ class Database:
             JOIN topics tp ON tp.id = t.topic_id
             WHERE t.teacher_id = $1
               AND t.mode = $2
+              AND t.topic_id = $4
               AND NOT EXISTS (
                   SELECT 1
                   FROM answers a
@@ -133,10 +147,33 @@ class Database:
             teacher_id,
             mode,
             student_id,
+            topic_id,
         )
         if not row:
             return None
         return Task(**dict(row))
+
+    async def list_recent_teacher_formulas(
+        self,
+        teacher_id: int,
+        topic_id: int,
+        mode: str,
+        limit: int = 10,
+    ) -> list[str]:
+        rows = await self.pool.fetch(
+            """
+            SELECT task_text
+            FROM tasks
+            WHERE teacher_id = $1 AND topic_id = $2 AND mode = $3
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4
+            """,
+            teacher_id,
+            topic_id,
+            mode,
+            limit,
+        )
+        return [str(row["task_text"]) for row in rows]
 
     async def create_task(
         self,
@@ -147,23 +184,23 @@ class Database:
         task_hint_text: str | None,
         task_answer_text: str | None,
         task_image_file_id: str | None,
-    ) -> int:
-        return int(
-            await self.pool.fetchval(
-                """
-                INSERT INTO tasks (topic_id, teacher_id, mode, task_text, task_hint_text, task_answer_text, task_image_file_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id
-                """,
-                topic_id,
-                teacher_id,
-                mode,
-                task_text,
-                task_hint_text,
-                task_answer_text,
-                task_image_file_id,
-            )
+    ) -> int | None:
+        task_id = await self.pool.fetchval(
+            """
+            INSERT INTO tasks (topic_id, teacher_id, mode, task_text, task_hint_text, task_answer_text, task_image_file_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (topic_id, teacher_id, mode, task_text) DO NOTHING
+            RETURNING id
+            """,
+            topic_id,
+            teacher_id,
+            mode,
+            task_text,
+            task_hint_text,
+            task_answer_text,
+            task_image_file_id,
         )
+        return int(task_id) if task_id is not None else None
 
     async def list_teacher_tasks(self, teacher_id: int) -> list[Task]:
         rows = await self.pool.fetch(

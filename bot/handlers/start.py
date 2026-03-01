@@ -3,6 +3,10 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.exceptions import TelegramBadRequest
+
+import base64
+import io
 
 from bot.db import Database, Student, Task, Teacher, TheoryPage, Topic
 from bot.keyboards.common import (
@@ -20,6 +24,7 @@ router = Router()
 
 
 class StudentFlow(StatesGroup):
+    choosing_topic = State()
     showing_theory = State()
     waiting_learning_answer = State()
     waiting_learning_retry_answer = State()
@@ -134,6 +139,7 @@ async def teacher_set_count(
     state: FSMContext,
     llm: GeminiClient,
     renderer: FormulaRenderer,
+    db: Database,
 ) -> None:
     value = (message.text or "").strip()
     if not value.isdigit():
@@ -149,12 +155,29 @@ async def teacher_set_count(
     topic_title = str(data["topic_title"])
     topic_prompt = str(data.get("topic_prompt") or topic_title)
     mode = str(data["mode"])
+    teacher_id = int(data["teacher_id"])
+    topic_id = int(data["topic_id"])
+
+    recent_task_texts = await db.list_recent_teacher_formulas(teacher_id, topic_id, mode, limit=10)
+    forbidden_formulas = [_extract_formula_from_task_text(item) for item in recent_task_texts if _extract_formula_from_task_text(item)]
 
     await message.answer("Генерирую варианты, это может занять до минуты…")
     candidates: list[dict[str, str | bytes | None]] = []
+    generated_formulas: list[str] = []
     for i in range(count):
         try:
-            candidates.append(await _build_candidate(llm, renderer, topic_prompt, mode, i + 1))
+            candidate = await _build_candidate(
+                llm,
+                renderer,
+                topic_prompt,
+                mode,
+                i + 1,
+                forbidden_formulas=forbidden_formulas + generated_formulas,
+            )
+            candidates.append(candidate)
+            generated_formula = str(candidate.get("latex") or "").strip()
+            if generated_formula:
+                generated_formulas.append(generated_formula)
         except Exception as exc:  # noqa: BLE001
             await message.answer(f"Ошибка генерации кандидата #{i + 1}: {exc}")
             break
@@ -165,7 +188,12 @@ async def teacher_set_count(
         return
 
     await state.set_state(TeacherCreateFlow.reviewing_generated)
-    await state.update_data(total_to_generate=len(candidates), generated_index=0, generated_candidates=candidates)
+    await state.update_data(
+        total_to_generate=len(candidates),
+        generated_index=0,
+        generated_candidates=candidates,
+        forbidden_formulas=forbidden_formulas,
+    )
     await _show_generated_candidate(message, state)
 
 
@@ -190,8 +218,22 @@ async def teacher_regenerate(
         await callback.answer("Нет кандидата для перегенерации", show_alert=True)
         return
 
+    forbidden_formulas = list(data.get("forbidden_formulas", []))
+    already_generated = [
+        str(item.get("latex") or "").strip()
+        for idx, item in enumerate(candidates)
+        if idx != generated_index and str(item.get("latex") or "").strip()
+    ]
+
     try:
-        candidates[generated_index] = await _build_candidate(llm, renderer, topic_prompt, mode, generated_index + 1)
+        candidates[generated_index] = await _build_candidate(
+            llm,
+            renderer,
+            topic_prompt,
+            mode,
+            generated_index + 1,
+            forbidden_formulas=forbidden_formulas + already_generated,
+        )
     except Exception as exc:  # noqa: BLE001
         await callback.answer(f"Ошибка генерации: {exc}", show_alert=True)
         return
@@ -227,6 +269,14 @@ async def teacher_approve(callback: CallbackQuery, state: FSMContext, db: Databa
         task_answer_text=candidate_answer,
         task_image_file_id=candidate_image_file_id,
     )
+
+    if task_id is None:
+        await callback.message.answer(
+            "Такой пример уже есть в вашей базе. Пожалуйста, перегенерируйте его.",
+            reply_markup=_generated_review_keyboard(),
+        )
+        await callback.answer()
+        return
 
     generated_index += 1
     if generated_index >= total_to_generate:
@@ -287,8 +337,40 @@ async def teacher_pool(message: Message, state: FSMContext, db: Database) -> Non
         await message.answer("Пул задач пока пуст.")
         return
 
-    await state.update_data(teacher_pool_ids=[task.id for task in tasks])
-    await message.answer("Ваш пул заданий:", reply_markup=_pool_list_keyboard(tasks))
+    await state.update_data(teacher_pool_ids=[task.id for task in tasks], teacher_pool_list_page=0)
+    await _send_pool_list(message, tasks, page=0)
+
+
+
+
+@router.callback_query(F.data.startswith("pool_list_nav:"))
+async def teacher_pool_list_nav(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    if not callback.data or not callback.message:
+        return
+
+    direction = callback.data.split(":", 1)[1]
+    teacher = await _get_teacher_from_callback(callback, db)
+    if not teacher:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+
+    tasks = await db.list_teacher_tasks(teacher.id)
+    if not tasks:
+        await callback.answer("Пул пуст", show_alert=True)
+        return
+
+    data = await state.get_data()
+    page = int(data.get("teacher_pool_list_page", 0))
+    total_pages = max((len(tasks) - 1) // 10 + 1, 1)
+
+    if direction == "next":
+        page = min(page + 1, total_pages - 1)
+    else:
+        page = max(page - 1, 0)
+
+    await state.update_data(teacher_pool_list_page=page)
+    await _send_pool_list(callback.message, tasks, page=page, edit=True)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("pool_open:"))
@@ -363,28 +445,86 @@ async def teacher_pool_back(callback: CallbackQuery, state: FSMContext, db: Data
         return
 
     tasks = await db.list_teacher_tasks(teacher.id)
-    await callback.message.answer("Ваш пул заданий:", reply_markup=_pool_list_keyboard(tasks))
+    data = await state.get_data()
+    page = int(data.get("teacher_pool_list_page", 0))
+    await _send_pool_list(callback.message, tasks, page=page)
     await callback.answer()
 
 
 @router.message(F.text == "Режим обучения")
 async def student_learning_mode(message: Message, state: FSMContext, db: Database) -> None:
-    pages = await db.list_theory_pages()
-    if not pages:
-        await _send_learning_task(message, state, db)
+    student = await _get_student_or_notify(message, db)
+    if not student:
         return
 
-    await state.set_state(StudentFlow.showing_theory)
-    await state.update_data(theory_index=0)
-    await _send_theory_page(message, pages, 0)
+    topics = await db.list_topics()
+    if not topics:
+        await message.answer("В базе нет тем.")
+        return
+
+    await state.set_state(StudentFlow.choosing_topic)
+    await state.update_data(pending_mode="learning")
+    await message.answer("Выберите тему:", reply_markup=_student_topics_keyboard(topics))
+
+
+
+
+@router.callback_query(StudentFlow.choosing_topic, F.data.startswith("student_topic:"))
+async def student_select_topic(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    if not callback.data or not callback.message:
+        return
+
+    student = await _get_student_from_callback_or_notify(callback, db)
+    if not student:
+        return
+
+    topic_id = int(callback.data.split(":", 1)[1])
+    topics = await db.list_topics()
+    topic = next((item for item in topics if item.id == topic_id), None)
+    if not topic:
+        await callback.answer("Тема не найдена", show_alert=True)
+        return
+
+    data = await state.get_data()
+    pending_mode = str(data.get("pending_mode") or "")
+    await state.update_data(selected_topic_id=topic_id, selected_topic_title=topic.title)
+
+    if pending_mode == "learning":
+        pages = await db.list_theory_pages(topic_id=topic_id)
+        if not pages:
+            await state.update_data(selected_topic_id=topic_id)
+            await _send_learning_task(callback.message, state, db)
+            await callback.answer()
+            return
+
+        await state.set_state(StudentFlow.showing_theory)
+        await state.update_data(theory_index=0)
+        await _send_theory_page(callback.message, pages, 0)
+        await callback.answer()
+        return
+
+    solved_count = await db.count_student_answers_by_mode(student.id, "testing")
+    if solved_count >= 10:
+        await state.clear()
+        await callback.message.answer("Вы уже завершили тестирование (10 из 10).", reply_markup=student_menu_keyboard())
+        await callback.answer()
+        return
+
+    await state.update_data(selected_topic_id=topic_id)
+    await _send_testing_task(callback.message, state, db, student)
+    await callback.answer()
 
 
 @router.message(StudentFlow.showing_theory, F.text == "Следующая страница")
 async def next_theory_page(message: Message, state: FSMContext, db: Database) -> None:
-    pages = await db.list_theory_pages()
     data = await state.get_data()
-    index = int(data.get("theory_index", 0)) + 1
+    selected_topic_id = int(data.get("selected_topic_id", 0)) or None
+    pages = await db.list_theory_pages(topic_id=selected_topic_id)
+    if not pages:
+        await message.answer("Теория по выбранной теме пока не добавлена. Нажмите «Начать решение».", reply_markup=theory_keyboard(False))
+        return
 
+    index = int(data.get("theory_index", 0)) + 1
     if index >= len(pages):
         await state.update_data(theory_index=max(len(pages) - 1, 0))
         await message.answer("Теория закончилась. Нажмите «Начать решение».", reply_markup=theory_keyboard(False))
@@ -396,6 +536,8 @@ async def next_theory_page(message: Message, state: FSMContext, db: Database) ->
 
 @router.message(StudentFlow.showing_theory, F.text == "Начать решение")
 async def start_solving_after_theory(message: Message, state: FSMContext, db: Database) -> None:
+    data = await state.get_data()
+    selected_topic_id = int(data.get("selected_topic_id", 0)) or None
     await _send_learning_task(message, state, db)
 
 
@@ -425,6 +567,8 @@ async def learning_show_answer(callback: CallbackQuery, state: FSMContext, rende
 
 @router.message(F.text == "Следующее задание")
 async def student_next_learning_task(message: Message, state: FSMContext, db: Database) -> None:
+    data = await state.get_data()
+    selected_topic_id = int(data.get("selected_topic_id", 0)) or None
     await _send_learning_task(message, state, db)
 
 
@@ -446,19 +590,26 @@ async def student_testing_mode(message: Message, state: FSMContext, db: Database
         await message.answer("Вы уже завершили тестирование (10 из 10).", reply_markup=student_menu_keyboard())
         return
 
-    await _send_testing_task(message, state, db, student)
+    topics = await db.list_topics()
+    if not topics:
+        await message.answer("В базе нет тем.")
+        return
+
+    await state.set_state(StudentFlow.choosing_topic)
+    await state.update_data(pending_mode="testing")
+    await message.answer("Выберите тему:", reply_markup=_student_topics_keyboard(topics))
 
 
 @router.message(StudentFlow.waiting_learning_answer, F.photo)
 @router.message(StudentFlow.waiting_learning_answer, F.document)
-async def learning_answer_first_attempt(message: Message, state: FSMContext, db: Database) -> None:
-    await _process_learning_attempt(message, state, db, is_retry=False)
+async def learning_answer_first_attempt(message: Message, state: FSMContext, db: Database, llm: GeminiClient) -> None:
+    await _process_learning_attempt(message, state, db, llm, is_retry=False)
 
 
 @router.message(StudentFlow.waiting_learning_retry_answer, F.photo)
 @router.message(StudentFlow.waiting_learning_retry_answer, F.document)
-async def learning_answer_retry_attempt(message: Message, state: FSMContext, db: Database) -> None:
-    await _process_learning_attempt(message, state, db, is_retry=True)
+async def learning_answer_retry_attempt(message: Message, state: FSMContext, db: Database, llm: GeminiClient) -> None:
+    await _process_learning_attempt(message, state, db, llm, is_retry=True)
 
 
 @router.message(StudentFlow.learning_incorrect_options, F.text == "Подсказка")
@@ -476,7 +627,7 @@ async def retry_learning(message: Message, state: FSMContext) -> None:
 
 @router.message(StudentFlow.waiting_testing_answer, F.photo)
 @router.message(StudentFlow.waiting_testing_answer, F.document)
-async def testing_answer_photo(message: Message, state: FSMContext, db: Database) -> None:
+async def testing_answer_photo(message: Message, state: FSMContext, db: Database, llm: GeminiClient) -> None:
     student = await _get_student_or_notify(message, db)
     if not student:
         return
@@ -490,7 +641,25 @@ async def testing_answer_photo(message: Message, state: FSMContext, db: Database
     if task_id is None:
         return
 
-    await db.save_answer(student.id, task_id, "testing", answer_image_file_id=file_id, is_correct=True)
+    state_data = await state.get_data()
+    expected_answer = str(state_data.get("current_answer") or "").strip()
+    if not expected_answer:
+        await message.answer("Не удалось найти эталонный ответ для проверки. Попробуйте другое задание.")
+        return
+
+    progress_message = await message.answer("⏳ Проверяю фото ответа…")
+    check = await _check_student_answer(message, llm, file_id, expected_answer, f"Задание #{task_id}")
+    await _finish_progress_message(progress_message, check)
+    if check is None:
+        return
+
+    if check.verdict == "unreadable":
+        await message.answer(
+            "Не удалось уверенно распознать ответ на фото. Пожалуйста, перефотографируйте и отправьте ещё раз."
+        )
+        return
+
+    await db.save_answer(student.id, task_id, "testing", answer_image_file_id=file_id, is_correct=(check.verdict == "correct"))
 
     solved_count = await db.count_student_answers_by_mode(student.id, "testing")
     if solved_count >= 10:
@@ -546,8 +715,19 @@ async def _build_candidate(
     topic_prompt: str,
     mode: str,
     index: int,
+    forbidden_formulas: list[str] | None = None,
 ) -> dict[str, str | bytes | None]:
-    generated = await llm.generate_task(topic_prompt)
+    effective_prompt = topic_prompt
+    if forbidden_formulas:
+        forbidden_lines = "\n".join(f"- {formula}" for formula in forbidden_formulas[:10])
+        effective_prompt = (
+            f"{topic_prompt}\n\n"
+            "Важно: не повторяй следующие 10 последних формул для этого преподавателя (в том числе в эквивалентной форме):\n"
+            f"{forbidden_lines}\n"
+            "Сгенерируй новый, отличный пример."
+        )
+
+    generated = await llm.generate_task(effective_prompt)
     image_bytes = renderer.render_integral_image(generated.latex_integral)
     text = f"Вычислите интеграл: {generated.latex_integral}"
     hint = _clean_student_text(generated.hint) if mode == "learning" else None
@@ -594,6 +774,12 @@ async def _show_generated_candidate(message: Message, state: FSMContext) -> None
     )
 
 
+def _student_topics_keyboard(topics: list[Topic]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=topic.title, callback_data=f"student_topic:{topic.id}")] for topic in topics]
+    )
+
+
 def _topics_keyboard(topics: list[Topic]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=topic.title, callback_data=f"teacher_topic:{topic.id}")] for topic in topics]
@@ -627,7 +813,14 @@ def _learning_answer_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[[InlineKeyboardButton(text="Показать ответ", callback_data="learning:show_answer")]]
     )
 
-def _pool_list_keyboard(tasks: list[Task]) -> InlineKeyboardMarkup:
+def _pool_list_keyboard(tasks: list[Task], page: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    total_pages = max((len(tasks) - 1) // page_size + 1, 1)
+    current_page = min(max(page, 0), total_pages - 1)
+
+    start = current_page * page_size
+    end = start + page_size
+    current_tasks = tasks[start:end]
+
     rows = [
         [
             InlineKeyboardButton(
@@ -635,9 +828,28 @@ def _pool_list_keyboard(tasks: list[Task]) -> InlineKeyboardMarkup:
                 callback_data=f"pool_open:{task.id}",
             )
         ]
-        for task in tasks[:30]
+        for task in current_tasks
     ]
+
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬅️", callback_data="pool_list_nav:prev"),
+            InlineKeyboardButton(text=f"{current_page + 1}/{total_pages}", callback_data="pool_noop"),
+            InlineKeyboardButton(text="➡️", callback_data="pool_list_nav:next"),
+        ]
+    )
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_pool_list(message: Message, tasks: list[Task], page: int, edit: bool = False) -> None:
+    if edit:
+        try:
+            await message.edit_text("Ваш пул заданий:", reply_markup=_pool_list_keyboard(tasks, page=page))
+            return
+        except TelegramBadRequest:
+            pass
+    await message.answer("Ваш пул заданий:", reply_markup=_pool_list_keyboard(tasks, page=page))
 
 
 def _pool_nav_keyboard(index: int, total: int) -> InlineKeyboardMarkup:
@@ -668,24 +880,38 @@ async def _send_pool_task(message: Message, task: Task, index: int, total: int) 
         await message.answer(text, reply_markup=_pool_nav_keyboard(index, total))
 
 
-async def _send_learning_task(message: Message, state: FSMContext, db: Database) -> None:
+async def _send_learning_task(message: Message, state: FSMContext, db: Database, topic_id: int | None = None, **_: object) -> None:
     student = await _get_student_or_notify(message, db)
     if not student:
         return
 
-    task = await db.get_next_task(student.id, student.teacher_id, "learning")
+    if topic_id is None:
+        state_data = await state.get_data()
+        topic_id = int(state_data.get("selected_topic_id", 0)) or None
+    if topic_id is None:
+        await message.answer("Сначала выберите тему.")
+        return
+
+    task = await db.get_next_task(student.id, student.teacher_id, "learning", topic_id=topic_id)
     if not task:
         await state.clear()
         await message.answer("Доступные задания для обучения закончились.", reply_markup=student_menu_keyboard())
         return
 
     await state.set_state(StudentFlow.waiting_learning_answer)
-    await state.update_data(task_id=task.id, current_hint=task.task_hint_text, current_answer=task.task_answer_text)
+    await state.update_data(task_id=task.id, current_hint=task.task_hint_text, current_answer=task.task_answer_text, selected_topic_id=topic_id)
     await _send_task_with_prompt(message, task)
 
 
-async def _send_testing_task(message: Message, state: FSMContext, db: Database, student: Student) -> None:
-    task = await db.get_next_task(student.id, student.teacher_id, "testing")
+async def _send_testing_task(message: Message, state: FSMContext, db: Database, student: Student, topic_id: int | None = None, **_: object) -> None:
+    if topic_id is None:
+        state_data = await state.get_data()
+        topic_id = int(state_data.get("selected_topic_id", 0)) or None
+    if topic_id is None:
+        await message.answer("Сначала выберите тему.")
+        return
+
+    task = await db.get_next_task(student.id, student.teacher_id, "testing", topic_id=topic_id)
     if not task:
         await state.clear()
         await message.answer(
@@ -695,7 +921,7 @@ async def _send_testing_task(message: Message, state: FSMContext, db: Database, 
         return
 
     await state.set_state(StudentFlow.waiting_testing_answer)
-    await state.update_data(task_id=task.id)
+    await state.update_data(task_id=task.id, current_answer=task.task_answer_text, selected_topic_id=topic_id)
     await _send_task_with_prompt(message, task)
 
 
@@ -717,7 +943,7 @@ async def _send_task_with_prompt(message: Message, task: Task) -> None:
     if not task.task_image_file_id:
         lines.append(task.task_text)
 
-    answer_button = None
+    answer_button = waiting_answer_keyboard() if task.mode == "testing" else None
     if task.mode == "learning" and task.task_answer_text:
         lines.append("Чтобы посмотреть решение-ответ, нажмите кнопку ниже.")
         answer_button = _learning_answer_keyboard()
@@ -730,10 +956,11 @@ async def _send_task_with_prompt(message: Message, task: Task) -> None:
     else:
         await message.answer(text, reply_markup=answer_button)
 
-    await message.answer("Выберите действие:", reply_markup=waiting_answer_keyboard())
+    if task.mode == "learning":
+        await message.answer("Отправьте фото с ответом или нажмите «Пропустить задание».", reply_markup=waiting_answer_keyboard())
 
 
-async def _process_learning_attempt(message: Message, state: FSMContext, db: Database, is_retry: bool) -> None:
+async def _process_learning_attempt(message: Message, state: FSMContext, db: Database, llm: GeminiClient, is_retry: bool) -> None:
     student = await _get_student_or_notify(message, db)
     if not student:
         return
@@ -747,10 +974,30 @@ async def _process_learning_attempt(message: Message, state: FSMContext, db: Dat
     if task_id is None:
         return
 
-    if not is_retry:
+    state_data = await state.get_data()
+    expected_answer = str(state_data.get("current_answer") or "").strip()
+    if not expected_answer:
+        await message.answer("Не удалось найти эталонный ответ для проверки. Попробуйте следующее задание.")
+        return
+
+    progress_message = await message.answer("⏳ Проверяю фото ответа…")
+    check = await _check_student_answer(message, llm, file_id, expected_answer, f"Задание #{task_id}")
+    await _finish_progress_message(progress_message, check)
+    if check is None:
+        return
+
+    if check.verdict == "unreadable":
+        await state.set_state(StudentFlow.waiting_learning_retry_answer if is_retry else StudentFlow.waiting_learning_answer)
+        await message.answer(
+            "Не удалось уверенно распознать ответ на фото. Пожалуйста, перефотографируйте и отправьте ещё раз.",
+            reply_markup=waiting_answer_keyboard(),
+        )
+        return
+
+    if check.verdict == "incorrect":
         await state.set_state(StudentFlow.learning_incorrect_options)
         await message.answer(
-            "Ответ неверный. Выберите действие: подсказка, попробовать ещё раз или пропустить задание.",
+            f"Ответ неверный. {check.feedback}\n\nВыберите действие: подсказка, попробовать ещё раз или пропустить задание.",
             reply_markup=learning_incorrect_keyboard(),
         )
         return
@@ -770,6 +1017,15 @@ async def _get_task_id_or_reset(message: Message, state: FSMContext) -> int | No
     return int(task_id)
 
 
+
+
+def _extract_formula_from_task_text(task_text: str) -> str:
+    prefix = "Вычислите интеграл:"
+    text = task_text.strip()
+    if text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return text
+
 def _clean_student_text(value: str) -> str:
     cleaned = value.strip()
     if cleaned.startswith("$") and cleaned.endswith("$") and len(cleaned) >= 2:
@@ -778,6 +1034,48 @@ def _clean_student_text(value: str) -> str:
     if cleaned.lower().startswith("подсказка:"):
         cleaned = cleaned.split(":", 1)[1].strip()
     return cleaned
+
+
+
+
+async def _finish_progress_message(progress_message: Message, check_result) -> None:
+    try:
+        if check_result is not None and check_result.verdict == "unreadable":
+            await progress_message.edit_text("📷 Фото не удалось распознать.")
+        else:
+            await progress_message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+
+async def _check_student_answer(
+    message: Message,
+    llm: GeminiClient,
+    file_id: str,
+    expected_answer: str,
+    task_text: str,
+):
+    if not llm.enabled:
+        await message.answer("Проверка ответов временно недоступна: LLM не настроена.")
+        return None
+
+    try:
+        image_bytes, mime_type = await _download_telegram_image(message, file_id)
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        image_data_uri = f"data:{mime_type};base64,{image_base64}"
+        return await llm.check_student_answer(image_data_uri, expected_answer=expected_answer, task_text=task_text)
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"Не удалось проверить ответ через LLM: {exc}")
+        return None
+
+
+async def _download_telegram_image(message: Message, file_id: str) -> tuple[bytes, str]:
+    telegram_file = await message.bot.get_file(file_id)
+    destination = io.BytesIO()
+    await message.bot.download_file(telegram_file.file_path, destination=destination)
+    mime_type = "image/jpeg"
+    if message.document and message.document.file_id == file_id and message.document.mime_type:
+        mime_type = message.document.mime_type
+    return destination.getvalue(), mime_type
 
 
 def _extract_image_file_id(message: Message) -> str | None:
@@ -814,3 +1112,14 @@ async def _get_teacher_from_callback(callback: CallbackQuery, db: Database) -> T
     if not callback.from_user:
         return None
     return await db.get_teacher_by_telegram_id(callback.from_user.id)
+
+
+async def _get_student_from_callback_or_notify(callback: CallbackQuery, db: Database) -> Student | None:
+    if not callback.from_user:
+        return None
+
+    student = await db.get_student_by_telegram_id(callback.from_user.id)
+    if not student:
+        await callback.answer("Доступ запрещён: студент не найден в базе.", show_alert=True)
+        return None
+    return student

@@ -16,6 +16,12 @@ class GeneratedTask:
     answer: str
 
 
+@dataclass(slots=True)
+class AnswerCheckResult:
+    verdict: str  # correct | incorrect | unreadable
+    feedback: str
+
+
 class GeminiClient:
     def __init__(
         self,
@@ -49,16 +55,62 @@ class GeminiClient:
             "max_tokens": 500,
             "messages": [{"role": "user", "content": prompt}],
         }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
+        headers = self._headers()
 
         data = await self._post_json(self._endpoint, payload, headers, verify_ssl=self._verify_ssl)
         data = await self._resolve_async_if_needed(data, headers)
-        content = self._extract_content(data)
+        content = self._extract_content_for_generation(data)
         return self._parse_generation(content)
+
+    async def check_student_answer(
+        self,
+        answer_image_data_uri: str,
+        expected_answer: str,
+        task_text: str,
+    ) -> AnswerCheckResult:
+        if not self.enabled:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+
+        prompt = (
+            "Ты проверяешь ФИНАЛЬНЫЙ ответ студента по математическому анализу. "
+            "Студент прислал фотографию рукописного ОТВЕТА в тетради. "
+            "Если фото нечитабельно, размыто, обрезано, ответ неразборчив или ты сомневаешься в распознавании, "
+            "верни verdict=unreadable. "
+            "Если фото читается, сравни ответ на фото с эталонным ответом математически. "
+            "ВАЖНО: засчитывай как correct любые математически эквивалентные формы записи конечного ответа "
+            "(например алгебраически преобразованные, эквивалентные тригонометрические/логарифмические формы, "
+            "другая, но равносильная константа интегрирования). "
+            "НЕ засчитывай промежуточные шаги решения как correct, если это не финальный ответ к задаче. "
+            "Если ответ по смыслу неэквивалентен эталону — verdict=incorrect. "
+            "Отвечай СТРОГО JSON-объектом без markdown: "
+            '{"verdict":"correct|incorrect|unreadable","feedback":"краткий комментарий на русском"}.\n\n'
+            f"Задание: {task_text}\n"
+            f"Эталонный ответ: {expected_answer}"
+        )
+
+        payload = {
+            "is_sync": True,
+            "model": self._model,
+            "temperature": 0,
+            "max_tokens": 300,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": answer_image_data_uri}},
+                    ],
+                }
+            ],
+        }
+        headers = self._headers()
+
+        data = await self._post_json(self._endpoint, payload, headers, verify_ssl=self._verify_ssl)
+        data = await self._resolve_async_if_needed(data, headers)
+
+        content = self._extract_content_generic(data)
+        return self._parse_answer_check(content)
 
     async def _resolve_async_if_needed(self, data: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         status = str(data.get("status", "")).lower()
@@ -78,6 +130,13 @@ class GeminiClient:
             raise RuntimeError("LLM request is still processing too long. Please retry.")
 
         return data
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
 
     async def _post_json(
         self,
@@ -115,13 +174,33 @@ class GeminiClient:
                 "Set GEMINI_SSL_VERIFY=false or install proper CA certificates."
             )
 
+    def _extract_content_for_generation(self, data: dict[str, Any]) -> str:
+        candidates = self._collect_text_candidates(data)
+        generated = [t for t in candidates if "пример:" in t.lower() and "подсказка:" in t.lower() and "ответ:" in t.lower()]
+        if generated:
+            return generated[0]
+        raise RuntimeError(f"Unexpected LLM response format: {self._short(data)}")
+
+
+    # Backward-compatible alias for older call sites
     def _extract_content(self, data: dict[str, Any]) -> str:
+        return self._extract_content_for_generation(data)
+
+    def _extract_content_generic(self, data: dict[str, Any]) -> str:
+        candidates = self._collect_text_candidates(data)
+        for text in candidates:
+            if "{" in text and "}" in text:
+                return text
+        if candidates:
+            return candidates[0]
+        raise RuntimeError(f"Unexpected LLM response format: {self._short(data)}")
+
+    def _collect_text_candidates(self, data: dict[str, Any]) -> list[str]:
         candidates: list[str] = []
 
         def walk(node: Any) -> None:
             if isinstance(node, str):
-                if "пример:" in node.lower() and "подсказка:" in node.lower() and "ответ:" in node.lower():
-                    candidates.append(node)
+                candidates.append(node)
                 return
             if isinstance(node, dict):
                 for value in node.values():
@@ -132,11 +211,31 @@ class GeminiClient:
                     walk(item)
 
         walk(data)
+        return candidates
 
-        if candidates:
-            return candidates[0]
+    def _parse_answer_check(self, text: str) -> AnswerCheckResult:
+        cleaned = text.strip()
+        if cleaned.startswith("```") and cleaned.endswith("```"):
+            cleaned = cleaned.strip("`").strip()
 
-        raise RuntimeError(f"Unexpected LLM response format: {self._short(data)}")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+        if "{" in cleaned and "}" in cleaned:
+            cleaned = cleaned[cleaned.find("{") : cleaned.rfind("}") + 1]
+
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid answer-check JSON from LLM: {text}") from exc
+
+        verdict = str(payload.get("verdict", "")).strip().lower()
+        feedback = str(payload.get("feedback", "")).strip() or "Без комментария"
+
+        if verdict not in {"correct", "incorrect", "unreadable"}:
+            raise RuntimeError(f"Unsupported verdict from LLM: {payload}")
+
+        return AnswerCheckResult(verdict=verdict, feedback=feedback)
 
     def _parse_generation(self, text: str) -> GeneratedTask:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -163,21 +262,17 @@ class GeminiClient:
     def _sanitize_latex(self, value: str) -> str:
         cleaned = value.strip()
 
-        # unwrap optional markdown code fences
         if cleaned.startswith("```") and cleaned.endswith("```"):
             cleaned = cleaned.strip("`").strip()
 
-        # remove optional raw-string wrappers: r"..." / r'...'
         if (cleaned.startswith('r"') and cleaned.endswith('"')) or (
             cleaned.startswith("r'") and cleaned.endswith("'")
         ):
             cleaned = cleaned[2:-1].strip()
 
-        # remove optional $...$ wrappers
         if cleaned.startswith("$") and cleaned.endswith("$") and len(cleaned) >= 2:
             cleaned = cleaned[1:-1].strip()
 
-        # sometimes model returns quoted latex
         if (cleaned.startswith('"') and cleaned.endswith('"')) or (
             cleaned.startswith("'") and cleaned.endswith("'")
         ):
